@@ -1,0 +1,208 @@
+---
+title: "01. Tree Selection"
+author: "Audrey Salerno"
+date: "1/3/2025"
+output: html_document
+---
+
+# Overview
+
+This document selects the trees appropriate for use in our likelihood analysis of individual tree mortality. 
+First, I select the plots we have multiple censuses and disturbance data for. Second, I select trees from the first census that are present in the second and keep the ones that were `deleted` from the second after also dying in the interim between censuses. I correct for `errors` in species identification, mortality (decay and status), size, tree location, etc to hopefully ensure we have an accurate dataset. 
+
+**Packages**
+
+```{r}
+#| warning: false
+library(tidyverse);library(pool);library(readxl); library(purrr); library(readr); library(dplR); library(RPostgreSQL); library(knitr)
+```
+
+**Database connection**
+```{r}
+# Connect to the database
+KELuser <- dbPool(RPostgreSQL::PostgreSQL(),
+                  dbname = 'remoteforestsorg',
+                  host = '91.239.201.14',
+                  port = 4010,
+                  user = 'remoteforests002', 
+                  password = 'COVBtxQ5')
+```
+
+# Plot ID data gather
+
+::: panel-tabset
+
+## Plots used in disturbance
+
+```{r}
+plot_level <- read_csv("data/plot.all.csv") %>% 
+  distinct(., plotid)
+```
+
+## Second census - plot_ids
+
+```{r}
+plot.id.2 <-  tbl(KELuser, "plot") %>%
+  filter(country %in% c("Albania", "Bosnia", "Bulgaria", "Croatia", "Romania"),
+         foresttype %in% c("beech"),
+         !census %in% c(1),
+         !is.na(lng),
+         !is.na(lat)) %>%
+ filter(!location %in% c("Fagaras", "Maramures")) %>%
+filter(plotid %in% plot_level$plotid) %>%
+ pull(id)
+```
+
+**Second-census plot data**
+```{r}
+plot.id.2.coll <- tbl(KELuser, "plot") %>%
+  filter(id %in% plot.id.2) %>%
+  select(plotid, newplotsize = plotsize) %>%
+collect()
+```
+
+## First census - plot_ids
+
+```{r}
+plot.id.1 <-  tbl(KELuser, "plot") %>%
+  filter(ownership %in% 1,
+          country %in% c("Albania", "Bosnia", "Bulgaria", "Croatia", "Romania"),
+         foresttype %in% c("beech"),
+        plottype %in% c(3, 4),
+         census %in% c(1),
+         !is.na(lng),
+         !is.na(lat)) %>%
+ filter(!location %in% c("Fagaras", "Maramures"),
+         plotid %in% local(plot.id.2.coll$plotid)) %>%
+ pull(id)
+```
+
+**Check differences in plot size between first and second census**
+
+Good to know the plot size differences... 
+
+```{r}
+ plot.id.2.coll %>%
+   inner_join(., tbl(KELuser, "plot") %>%
+  filter(id %in% plot.id.1) %>%
+  select(plotid, plotsize), by = "plotid", copy = TRUE) %>%
+  mutate(sizechnge = ifelse(newplotsize == plotsize, "no change", "change")) %>%
+  filter(sizechnge %in% "change")
+```
+
+# Trees
+
+::: panel-tabset
+
+## First census
+
+Filtering parameters for trees in first census. 
+
+* !onplot %in% c(0,99) - trees from outside plot boundaries
+* !growth %in% 99 - undefined growth (only 16 trees) - from first census only 
+
+For first census data collection I am just collecting all trees. I will filter out for unharmed status from the first census in a few sections. 
+
+```{r}
+tree.census.1 <- tbl(KELuser, "tree") %>%
+   filter(!onplot %in% c(0,99),
+          !growth %in% 99) %>%
+  select(treeid, tree_id = id, plot_id, growth, layer, onplot, x_m, y_m, dbh_mm, decay, species, treetype, status) %>%
+  inner_join(., tbl(KELuser, "plot") %>% filter(id %in% plot.id.1) %>% 
+      select(location, stand, plotid, id, lng, lat, date, altitude_m, slope, aspect), by = c("plot_id" = "id")) %>%
+    inner_join(., tbl(KELuser, "species_fk") %>% select(-sp_code), by = c("species" = "id")) %>%
+    distinct(., treeid, .keep_all = TRUE) %>%
+  collect()
+```
+
+## Second census
+
+Trees excluded are those not found within the plot boundaries or are missing their on plot distinction.
+
+```{r}
+tree.census.2 <- tbl(KELuser, "tree") %>%
+     filter(!onplot %in% c(0,99)) %>%
+          rename(tree_id = id) %>%
+  select(treeid, onplot_re = onplot, status_re = status, growth_re = growth, layer_re = layer, re_species = species, dbh_mm_re = dbh_mm, re_x_m = x_m, re_y_m = y_m, re_decay = decay, plot_id) %>%
+  inner_join(., tbl(KELuser, "species_fk") %>% select(-sp_code) %>% rename(sp_type_re = sp_type, sp_group_dist_re = sp_group_dist), by = c("re_species" = "id")) %>%
+  inner_join(., tbl(KELuser, "plot") %>% filter(id %in% plot.id.2) %>%
+               select(date_re = date, location, stand, plotid, id), by = c("plot_id" = "id")) %>%
+  select(-onplot_re) %>%
+  collect() 
+```
+
+## Full trees
+
+I filtered out the trees that were dead in the first census and any new in-growth to capture only mortality between first and second censuses. I further filtered out any trees with a damaged canopy status and corrected for any missing or incorrect information in the second census or first census like those trees that came back alive in the second census or those that were deleted after the first because they died and decayed between censes. 
+
+**Undamaged canopy in first census**
+
+```{r}
+full_trees <- tree.census.1 %>% # #12195
+  full_join(., tree.census.2 %>% rename(re_plot_id = plot_id), by = c("location", "stand", "plotid", "treeid")) %>% #ignore all of the added trees from ingrowth in the second census - there are some larger trees that were likely missed 
+mutate(x_m = ifelse(!is.na(re_x_m), re_x_m, x_m), # replace x - operating off assumption that second measure is more accurate
+        y_m = ifelse(!is.na(re_y_m), re_y_m, y_m), # replace y 
+       lord1 = ifelse(decay > -1, "dead", "live"), # live or dead in census 1
+       re_decay = ifelse(is.na(re_decay),10, re_decay), # 10 decay for census 1 trees missing in census 2 - assumed dead
+       lord = ifelse(re_decay > -1, "dead", "live"), # live or dead in census 2
+       dbh_mm = ifelse(is.na(dbh_mm), dbh_mm_re, dbh_mm), # if first dbh is na, replace first with second measure
+       dbh_mm_re = ifelse(is.na(dbh_mm_re), dbh_mm, dbh_mm_re), # if second dbh is na, replace with first
+       dbh_mm_re = ifelse(dbh_mm > dbh_mm_re, dbh_mm, dbh_mm_re), # if first dbh is greater than second, replace seconf with first
+      re_species = ifelse(is.na(re_species),species, re_species), # if second species is na, replace with first 
+      species = ifelse(species %in% re_species,species, re_species), # basically same as other species stuff above and below
+      sp_group_dist_re = ifelse(is.na(sp_group_dist_re),sp_group_dist, sp_group_dist_re),# basically same as other species stuff above and below
+      sp_group_dist = ifelse(sp_group_dist %in% sp_group_dist_re, sp_group_dist, sp_group_dist_re), # basically same as other species stuff above and below
+      sp_type_re = ifelse(is.na(sp_type_re),sp_type, sp_type_re), # replace sp_type if na
+      sp_type = ifelse(sp_type %in% sp_type_re,sp_type, sp_type_re), # replace sp_type if different
+      decay = ifelse(re_decay >= decay, decay, re_decay), # replace decay in first with second if tree was alive in second 
+      status = ifelse(status_re >= status|is.na(status_re), status, status_re), # replace status in first census with second if the tree was living in second census
+      growth = ifelse(growth %in% -1, growth_re, growth), #replace growth with n
+      lord = ifelse(re_decay > -1, "dead", "live"), # live or dead in census 2
+      lord1 = ifelse(decay > -1, "dead", "live")) %>% # live or dead in census 1
+  select(-sp_group_dist_re, -sp_type_re, -re_species) %>%
+filter(!is.na(tree_id)) %>% # trees present in first census only
+     filter(status %in% 1,
+             !growth %in% 99) # status of 1 and one tree with growth 99 
+```
+
+:::
+
+# Mortality numbers
+
+## Species
+
+```{r}
+kable(full_trees %>% 
+  group_by(sp_group_dist, lord) %>%
+  summarise(count = n()) %>%
+  pivot_wider(names_from = lord, values_from = count))
+```
+
+## Growth
+
+```{r}
+kable(full_trees %>% 
+  group_by(growth, lord) %>%
+  summarise(count = n()) %>%
+  pivot_wider(names_from = lord, values_from = count))
+```
+
+## Size distribution
+
+```{r}
+ggplot(full_trees)+
+  geom_boxplot(aes(x = as.factor(growth), y = dbh_mm, fill = lord))+
+  theme_bw()
+```
+
+
+
+
+
+
+
+
+
+
+
+

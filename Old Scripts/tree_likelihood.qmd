@@ -1,0 +1,252 @@
+---
+title: "Data Gather - Trees"
+format:
+  html:
+    theme: spacelab
+    toc: true
+    number-sections: true
+---
+
+# Overview
+
+This document will go cover the tree-level data selection and numbers in each sample class, core numbers, usable plots (limited by disturbance reconstruction and plot resampling), proposed hypotheses. 
+
+::: panel-tabset
+
+## Gather data & identifiers
+
+**Packages**
+
+```{r}
+#| warning: false
+library(tidyverse);library(pool);library(readxl); library(purrr); library(readr); library(dplR); library(RPostgreSQL)
+```
+
+**Database connection**
+```{r}
+# Connect to the database
+KELuser <- dbPool(RPostgreSQL::PostgreSQL(),
+                  dbname = 'remoteforestsorg',
+                  host = '91.239.201.14',
+                  port = 4010,
+                  user = 'remoteforests002', 
+                  password = 'COVBtxQ5')
+```
+
+## Disturbance at plot-level
+
+```{r}
+plot_level <- read_csv("data/plot.all.csv") %>% 
+  distinct(., plotid)
+```
+
+## Check plot size differences 
+
+**ID - Second census**
+
+```{r}
+plot.id.2 <-  tbl(KELuser, "plot") %>%
+  filter(country %in% c("Albania", "Bosnia", "Bulgaria", "Croatia", "Romania"),
+         foresttype %in% c("beech"),
+         !census %in% c(1),
+         !is.na(lng),
+         !is.na(lat)) %>%
+ filter(!location %in% c("Fagaras", "Maramures")) %>%
+filter(plotid %in% plot_level$plotid) %>%
+ pull(id)
+```
+
+**Second-census plot data**
+```{r}
+plot.id.2.coll <- tbl(KELuser, "plot") %>%
+  filter(id %in% plot.id.2) %>%
+  select(plotid, newplotsize = plotsize) %>%
+collect()
+```
+
+**ID - First census**
+```{r}
+plot.id.1 <-  tbl(KELuser, "plot") %>%
+  filter(ownership %in% 1,
+          country %in% c("Albania", "Bosnia", "Bulgaria", "Croatia", "Romania"),
+         foresttype %in% c("beech"),
+        plottype %in% c(3, 4),
+         census %in% c(1),
+         !is.na(lng),
+         !is.na(lat)) %>%
+ filter(!location %in% c("Fagaras", "Maramures"),
+         plotid %in% local(plot.id.2.coll$plotid)) %>%
+ pull(id)
+```
+
+**Check differences in plot size between first and second census**
+```{r}
+ plot.id.2.coll %>%
+   inner_join(., tbl(KELuser, "plot") %>%
+  filter(id %in% plot.id.1) %>%
+  select(plotid, plotsize), by = "plotid", copy = TRUE) %>%
+  mutate(sizechnge = ifelse(newplotsize == plotsize, "no change", "change")) %>%
+  filter(sizechnge %in% "change")
+```
+
+:::
+
+## Trees
+
+Filtering parameters for trees to use 
+
+<!-- * DBH >= 60 - the minimum dbh measured -->
+* !onplot %in% c(0,99) - trees from outside plot boundaries (will adjust any changes in plot size with other onplot)
+* !species %in% c("Lians", "99") - remove these other species
+<!-- * treetype %in% c("0","g") - suppressed + all regular trees --> don't need to specify this with the onplot 
+* !growth %in% 99 - undefined growth (only 16 trees) 
+
+**Question**: on plot or not on plot? There are only five plots that changed in size from the first to second census (they are in CRO-SMR). So if you include entire plot - those 5 plots will need to be shrunk still to onplot %in% c(1,2) or there may be an artificial increase in mortality without knowing whether those trees were alive or not in the first census.
+
+::: panel-tabset
+
+### First census - live/dead - all decay 
+
+For first census data collection I am just collecting all trees. I will filter out for unharmed status from the first census in a few sections. 
+
+**I am removing any trees outside of the original area for the 5 plots that changed size**
+
+```{r}
+tree.census.1 <- tbl(KELuser, "tree") %>%
+   filter(!onplot %in% c('0','99')) %>%
+  select(treeid, tree_id = id, plot_id, growth, layer, onplot, x_m, y_m, dbh_mm, decay, species, treetype, status) %>%
+  inner_join(., tbl(KELuser, "plot") %>% filter(id %in% plot.id.1) %>% 
+      select(location, stand, plotid, id, lng, lat, date, altitude_m, slope, aspect), by = c("plot_id" = "id")) %>%
+  filter(!plotid %in% c("CRO_SMR_104_2", "CRO_SMR_094_2", "CRO_SMR_103_2", "CRO_SMR_105_1"," CRO_SMR_094_1")| !onplot %in% c(0,3)) %>%
+    inner_join(., tbl(KELuser, "species_fk") %>% select(-sp_code), by = c("species" = "id")) %>%
+    distinct(., treeid, .keep_all = TRUE) %>%
+  collect()
+```
+
+### Second census - live/dead all
+
+```{r}
+tree.census.2 <- tbl(KELuser, "tree") %>%
+     filter(!onplot %in% c(0,99)) %>%
+          rename(tree_id = id) %>%
+  select(treeid, onplot_re = onplot, status_re = status, growth_re = growth, layer_re = layer, re_species = species, dbh_mm_re = dbh_mm, re_x_m = x_m, re_y_m = y_m, re_decay = decay, plot_id) %>%
+  inner_join(., tbl(KELuser, "species_fk") %>% select(-sp_code) %>% rename(sp_type_re = sp_type, sp_group_dist_re = sp_group_dist), by = c("re_species" = "id")) %>%
+  inner_join(., tbl(KELuser, "plot") %>% filter(id %in% plot.id.2) %>%
+               select(date_re = date, location, stand, plotid, id), by = c("plot_id" = "id")) %>%
+  filter(!plotid %in% c("CRO_SMR_104_2", "CRO_SMR_094_2", "CRO_SMR_103_2", "CRO_SMR_105_1"," CRO_SMR_094_1")| !onplot_re %in% c(0,3)) %>% # keep the trees within the 1000 m2 circle for these plots that got larger. 
+  select(-onplot_re) %>%
+  collect() 
+```
+
+### Filter out dead trees from first census
+
+I filtered out the trees that were dead in the first census to capture only mortality between first and second censuses.
+
+**Undamaged canopy in first census**
+```{r}
+full_trees <- tree.census.1 %>%  #12100
+  full_join(., tree.census.2 %>% rename(re_plot_id = plot_id), by = c("location", "stand", "plotid", "treeid")) %>% #ignore all of the added trees from ingrowth in the second census - there are some larger trees that were likely missed 
+mutate(x_m = ifelse(!is.na(re_x_m), re_x_m, x_m),
+        y_m = ifelse(!is.na(re_y_m), re_y_m, y_m),
+       lord1 = ifelse(decay > -1, "dead", "live"),
+       re_decay = ifelse(is.na(re_decay),10, re_decay),
+       lord = ifelse(re_decay > -1, "dead", "live"),
+       dbh_mm = ifelse(is.na(dbh_mm), dbh_mm_re, dbh_mm),
+       dbh_mm_re = ifelse(is.na(dbh_mm_re), dbh_mm, dbh_mm_re), 
+       dbh_mm_re = ifelse(dbh_mm > dbh_mm_re, dbh_mm, dbh_mm_re),
+      re_species = ifelse(is.na(re_species),species, re_species),
+      species = ifelse(species %in% re_species,species, re_species),
+      sp_group_dist_re = ifelse(is.na(sp_group_dist_re),sp_group_dist, sp_group_dist_re),
+      sp_group_dist = ifelse(sp_group_dist %in% sp_group_dist_re, sp_group_dist, sp_group_dist_re),
+      sp_type_re = ifelse(is.na(sp_type_re),sp_type, sp_type_re),
+      sp_type = ifelse(sp_type %in% sp_type_re,sp_type, sp_type_re),
+      decay = ifelse(re_decay >= decay, decay, re_decay),
+    #  status_ch = ifelse(status_re >= status, status , status_re),
+      lord = ifelse(re_decay > -1, "dead", "live"),
+      lord1 = ifelse(decay > -1, "dead", "live")) %>%
+  select(-sp_group_dist_re, -sp_type_re, -re_species) %>%
+  filter(!is.na(tree_id)) %>% # trees present in first census only 
+     filter(status %in% 1)
+    
+```
+
+### Filter out dead trees from first census
+
+I filtered out the trees that were dead in the first census to capture only mortality between first and second censuses.
+
+```{r}
+census_1 <- full_trees %>% 
+  filter(!i
+
+census_2 <- full_trees %>% #11991
+  filter(!lord1 %in% "dead") %>%
+   filter(!is.na(tree_id)) %>%
+  select(-dbh_mm)%>%
+  rename(dbh_mm = dbh_mm_re) #removed dead trees in census 1
+
+census_2 %>%
+  group_by(lord, plotid) %>%
+  summarise(n())
+
+str(census_2)
+
+
+census_2 %>% 
+  group_by(sp_group_dist, lord) %>%
+  summarise(n())
+```
+
+:::
+
+## Mortality numbers - quick look
+
+### Counts
+
+```{r}
+tree.d2_l2 %>%
+  group_by(sp_group_dist, lord) %>%
+  summarise(n = n())
+```
+
+### First census growth
+```{r}
+tree.d2_l2 %>%
+  group_by(lord, growth_cens1)  %>%
+  summarise(n = n())
+```
+
+### DBH distribution of dead trees
+
+```{r}
+tree.d2_l2 %>%
+  filter(lord %in% "dead") %>%
+  ggplot()+
+  geom_histogram(aes(x = dbh_mm)) +
+  #facet_wrap(~lord)+
+  theme_bw()
+```
+
+# Hypotheses
+
+Come up with multiple competing hypotheses whereby the functions we model the response with are used with our input data to predict the likelihood of the outcome observed in our actual data - like mortality. How predictive are these input variables at identifying this outcome
+
+```{r}
+ggplot(tree.d2_l2)+
+  geom_point(aes(x = dbh_mm, y = lord)) +
+  facet_wrap(sp_group_dist~growth_cens1)+
+  theme_bw()
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
